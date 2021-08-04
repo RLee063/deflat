@@ -16,9 +16,8 @@ from util import *
 import logging
 logging.getLogger('angr.state_plugins.symbolic_memory').setLevel(logging.ERROR)
 # logging.getLogger('angr.sim_manager').setLevel(logging.DEBUG)
-    
 
-def get_relevant_nop_nodes(supergraph, pre_dispatcher_node, prologue_node, retn_node):
+def get_relevant_nop_nodes(supergraph, pre_dispatcher_node, prologue_node, ret_nodes):
     # relevant_nodes = list(supergraph.predecessors(pre_dispatcher_node))
     relevant_nodes = []
     nop_nodes = []
@@ -27,14 +26,15 @@ def get_relevant_nop_nodes(supergraph, pre_dispatcher_node, prologue_node, retn_
             # XXX: use node.size is faster than to create a block
             relevant_nodes.append(node)
             continue
-        if node.addr in (prologue_node.addr, retn_node.addr, pre_dispatcher_node.addr):
+        if node.addr in (prologue_node.addr, pre_dispatcher_node.addr):
+            continue
+        if node.addr in [node.addr for node in ret_nodes]:
             continue
         nop_nodes.append(node)
     return relevant_nodes, nop_nodes
 
 
 def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=None, modify_value=None, inspect=False):
-
     def retn_procedure(state):
         ip = state.solver.eval(state.regs.ip)
         project.unhook(ip)
@@ -70,55 +70,44 @@ def symbolic_execution(project, relevant_block_addrs, start_addr, hook_addrs=Non
 
     return None
 
-
-def main():
-    parser = argparse.ArgumentParser(description="deflat control flow script")
-    parser.add_argument("-f", "--file", help="binary to analyze")
-    parser.add_argument(
-        "--addr", help="address of target function in hex format")
-    args = parser.parse_args()
-
-    if args.file is None or args.addr is None:
-        parser.print_help()
-        sys.exit(0)
-
-    filename = args.file
-    start = int(args.addr, 16)
-
-    project = angr.Project(filename, load_options={'auto_load_libs': False})
-    # do normalize to avoid overlapping blocks, disable force_complete_scan to avoid possible "wrong" blocks
-    cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
-    target_function = cfg.functions.get(start)
+def main(target_function):
+    # Note that our function can't tell whether this function has been flated!!!
+    start = target_function.addr
     # A super transition graph is a graph that looks like IDA Pro's CFG
     supergraph = am_graph.to_supergraph(target_function.transition_graph)
 
     base_addr = project.loader.main_object.mapped_base >> 12 << 12
 
-    # get prologue_node and retn_node
+    # get prologue_node and ret_nodes
     prologue_node = None
+    ret_nodes = []
     for node in supergraph.nodes():
         if supergraph.in_degree(node) == 0:
             prologue_node = node
-        if supergraph.out_degree(node) == 0 and len(node.out_branches) == 0:
-            retn_node = node
+        # [-] Not ferfect !
+        if supergraph.out_degree(node) == 0:
+            ret_nodes.append(node)
 
     if prologue_node is None or prologue_node.addr != start:
-        print("Something must be wrong...")
-        sys.exit(-1)
+        print("Cant find prologue node...")
+        return False
 
     main_dispatcher_node = list(supergraph.successors(prologue_node))[0]
     for node in supergraph.predecessors(main_dispatcher_node):
-        if node.addr != prologue_node.addr:
+        if node.addr != prologue_node.addr and node.addr != main_dispatcher_node.addr:
             pre_dispatcher_node = node
             break
 
+    if pre_dispatcher_node is None:
+        print("Cant find pre_dispatcher node...")
+        return False
     relevant_nodes, nop_nodes = get_relevant_nop_nodes(
-        supergraph, pre_dispatcher_node, prologue_node, retn_node)
+        supergraph, pre_dispatcher_node, prologue_node, ret_nodes)
     print('*******************relevant blocks************************')
     print('prologue: %#x' % start)
     print('main_dispatcher: %#x' % main_dispatcher_node.addr)
     print('pre_dispatcher: %#x' % pre_dispatcher_node.addr)
-    print('retn: %#x' % retn_node.addr)
+    print('ret:', [hex(node.addr) for node in ret_nodes])
     relevant_block_addrs = [node.addr for node in relevant_nodes]
     print('relevant_blocks:', [hex(addr) for addr in relevant_block_addrs])
 
@@ -126,8 +115,11 @@ def main():
     relevants = relevant_nodes
     relevants.append(prologue_node)
     relevants_without_retn = list(relevants)
-    relevants.append(retn_node)
-    relevant_block_addrs.extend([prologue_node.addr, retn_node.addr])
+
+    for node in ret_nodes:
+        relevants.append(node)
+    relevant_block_addrs.append(prologue_node.addr)
+    relevant_block_addrs.extend([node.addr for node in ret_nodes])
 
     flow = defaultdict(list)
     patch_instrs = {}
@@ -179,7 +171,7 @@ def main():
     for k, v in flow.items():
         print('%#x: ' % k.addr, [hex(child) for child in v])
 
-    print('%#x: ' % retn_node.addr, [])
+    print([hex(node.addr) for node in ret_nodes])
 
     print('************************patch*****************************')
     with open(filename, 'rb') as origin:
@@ -187,7 +179,7 @@ def main():
         origin_data = bytearray(origin.read())
         origin_data_len = len(origin_data)
 
-    recovery_file = filename + '_recovered'
+    recovery_file = filename
     recovery = open(recovery_file, 'wb')
 
     # patch irrelevant blocks
@@ -271,4 +263,11 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    filename = "ctf"
+    project = angr.Project(filename, load_options={'auto_load_libs': False})
+    cfg = project.analyses.CFGFast(normalize=True, force_complete_scan=False)
+    addrs = []
+    for addr in addrs:
+        target_function = cfg.functions.get(addr)
+        main(target_function)
+        exit(0)
